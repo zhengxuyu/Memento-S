@@ -1,6 +1,5 @@
-"""ARC-AGI-3 ReactBufferAgent — refactored from ARC-AGI-3-Agents."""
-from arc.react_agent import ReactBufferAgent
+"""ARC-AGI-3 ReactAgent — minimal LLM-driven game agent."""
+from arc.react_agent import ReactAgent
 from arc.agent_base import Agent
-from arc.swarm import Swarm
 
-__all__ = ["ReactBufferAgent", "Agent", "Swarm"]
+__all__ = ["ReactAgent", "Agent"]

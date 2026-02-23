@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import json
-from typing import Any, Optional
+from typing import Any
 
 from core.utils.path_utils import _stringify_result
 
@@ -13,34 +12,29 @@ class SkillExecutionError(RuntimeError):
 def _normalize_plan(ops_or_plan: Any) -> dict:
     """
     Accept either:
-      - list[dict] operations -> {"ops": [...]}
+      - list[dict] tool calls/ops -> {"tool_calls": [...]}
       - a full plan dict -> plan
-      - a single op dict -> {"ops": [op]}
+      - a single tool call/op dict -> {"tool_calls": [op]}
     """
     if isinstance(ops_or_plan, list):
-        return {"ops": ops_or_plan}
+        return {"tool_calls": ops_or_plan}
     if isinstance(ops_or_plan, dict):
-        if "ops" in ops_or_plan:
+        if "tool_calls" in ops_or_plan or "ops" in ops_or_plan:
             return dict(ops_or_plan)
-        if "type" in ops_or_plan:
-            return {"ops": [ops_or_plan]}
+        if "type" in ops_or_plan or "function" in ops_or_plan or "name" in ops_or_plan:
+            return {"tool_calls": [ops_or_plan]}
         # Some skills accept shorthand at the top-level (e.g. query/url).
         if any(k in ops_or_plan for k in ("query", "url")):
             return dict(ops_or_plan)
-        return {"ops": [ops_or_plan]}
-    raise SkillExecutionError(f"Invalid plan/ops type: {type(ops_or_plan).__name__}")
-
-
-def _try_get_logger():
-    # TUI logger integration removed in CLI-only mode.
-    return None
+        return {"tool_calls": [ops_or_plan]}
+    raise SkillExecutionError(f"Invalid plan/tool_calls type: {type(ops_or_plan).__name__}")
 
 
 def call_skill(
     skill_name: str,
     ops_or_plan: Any,
     *,
-    caller: Optional[str] = None,
+    caller: str | None = None,
 ) -> str:
     """
     Call another skill through the agent bridge runtime.
@@ -50,20 +44,11 @@ def call_skill(
     name = skill_name.strip()
     plan = _normalize_plan(ops_or_plan)
 
-    log = _try_get_logger()
-    if log:
-        log.event("call_skill_start", caller=caller, skill=name, plan=plan)
-
     try:
-        from agent import execute_skill_plan, normalize_plan_shape
+        from core.skill_engine.skill_executor import execute_skill_plan, normalize_plan_shape
 
         result = execute_skill_plan(name, normalize_plan_shape(plan))
     except Exception as exc:
-        if log:
-            log.exception("call_skill_error", caller=caller, skill=name, error=str(exc), plan=plan)
         raise SkillExecutionError(f"call_skill: skill '{name}' failed: {exc}") from exc
 
-    out = _stringify_result(result).strip()
-    if log:
-        log.event("call_skill_done", caller=caller, skill=name, output=out, output_len=len(out))
-    return out
+    return _stringify_result(result).strip()

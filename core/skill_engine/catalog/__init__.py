@@ -1,0 +1,62 @@
+"""Catalog submodules split from skill_catalog.py."""
+
+from .catalog_cache import _ROUTER_STOPWORDS, _tokenize_for_semantic, _catalog_signature
+from .catalog_embedding import (
+    ensure_router_embedding_prewarm,
+    precompute_router_embedding_cache,
+    select_embedding_top_skills,
+)
+from .catalog_router import (
+    load_available_skills_block_from,
+    load_available_skills_block,
+    write_visible_skills_block,
+    parse_available_skills,
+    build_available_skills_xml,
+    _build_semantic_index,
+    _get_semantic_index,
+    select_semantic_top_skills,
+    _tokenize_for_bm25,
+    _build_bm25_index,
+    _get_bm25_index,
+    select_bm25_top_skills,
+    select_router_top_skills,
+    _resolve_catalog_jsonl_path,
+    _parse_int_or_zero,
+    _choose_catalog_entry,
+    parse_catalog_jsonl_text,
+    _load_router_catalog_from_jsonl,
+    _merge_skill_catalog,
+    build_router_step_note,
+    derive_semantic_goal,
+)
+
+__all__ = [
+    "_ROUTER_STOPWORDS",
+    "_tokenize_for_semantic",
+    "_catalog_signature",
+    "load_available_skills_block_from",
+    "load_available_skills_block",
+    "write_visible_skills_block",
+    "parse_available_skills",
+    "build_available_skills_xml",
+    "_build_semantic_index",
+    "_get_semantic_index",
+    "select_semantic_top_skills",
+    "_tokenize_for_bm25",
+    "_build_bm25_index",
+    "_get_bm25_index",
+    "select_bm25_top_skills",
+    "ensure_router_embedding_prewarm",
+    "precompute_router_embedding_cache",
+    "select_embedding_top_skills",
+    "select_router_top_skills",
+    "_resolve_catalog_jsonl_path",
+    "_parse_int_or_zero",
+    "_choose_catalog_entry",
+    "parse_catalog_jsonl_text",
+    "_load_router_catalog_from_jsonl",
+    "_merge_skill_catalog",
+    "build_router_step_note",
+    "derive_semantic_goal",
+]
+

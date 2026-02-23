@@ -47,21 +47,7 @@ class LLM(Agent):
         return None
 
     def _get_system_prompt_with_skills(self, game_context: str = "") -> str:
-        """Build system prompt with skills, using semantic routing if available.
-
-        Args:
-            game_context: Text describing current game state for routing.
-                          If empty, falls back to full skill loading.
-        """
-        # If routed context provided, always re-route (context changes each turn)
-        if game_context:
-            try:
-                from arc.skills_loader import load_routed_skills
-                return load_routed_skills(game_context)
-            except Exception as e:
-                logger.warning("Routed skill loading failed: %s", e)
-
-        # Fallback: cached full load
+        """Build system prompt with loaded skills."""
         if self._skills_system_prompt is not None:
             return self._skills_system_prompt
         try:

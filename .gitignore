@@ -1,2 +1,9 @@
-arc/__pycache__/
+__pycache__/
+*.pyc
 .env
+.DS_Store
+.vscode/
+recordings/
+checkpoints/
+environment_files/
+router_data/
