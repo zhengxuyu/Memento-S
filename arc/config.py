@@ -28,10 +28,14 @@ SKILLS_DIR = os.getenv("SKILLS_DIR", str(PROJECT_ROOT / "skills"))
 
 # Agent constants
 MAX_RETRIES = _env_int("ARC_MAX_RETRIES", 5)
-MAX_ACTIONS = _env_int("ARC_MAX_ACTIONS", 300)
+MAX_ACTIONS = _env_int("ARC_MAX_ACTIONS", 0)  # 0 = unlimited
 MESSAGE_LIMIT = _env_int("ARC_MESSAGE_LIMIT", 20)
 API_TIMEOUT = _env_int("ARC_API_TIMEOUT", 120)
 API_RETRIES = _env_int("ARC_API_RETRIES", 5)
+
+# Episode memory
+MEMORY_DIR = os.getenv("ARC_MEMORY_DIR", str(PROJECT_ROOT.parent / "memory"))
+MEMORY_WARMUP = _env_int("ARC_MEMORY_WARMUP", 3)  # cold start: no few-shot for first N episodes
 
 # Knowledge sections in SKILL.md
 KNOWLEDGE_HEADERS = {
