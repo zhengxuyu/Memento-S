@@ -1,22 +1,23 @@
 ---
-name: "Button Alignment Challenge"
-description: "Navigate a 5x5 block, trigger buttons to open gates, and perfectly center over a 3x3 goal before the timer expires."
+name: "Button & Gate Alignment"
+description: "Navigate a 5x5 block to step on switches to open gates, then precisely align over a 3x3 goal before time runs out."
 ---
+
 # How To Win (step-by-step)
-1. Locate the button (a structure of colors 0 and 1) and the goal (a 3x3 symbol of color 9).
-2. Move the player block onto the button to unlock the path.
-3. Confirm that impassable obstacles (color 5) blocking the goal have disappeared and turned into passable colors.
-4. Navigate your player block efficiently towards the goal.
-5. Center your 5x5 player block perfectly over the 3x3 goal (the boundaries of your 5x5 block must extend outward exactly 1 cell past the 3x3 goal in all directions).
+1. Locate the switch mechanism (small cluster of colors 0 and 1).
+2. Move the 5x5 player block to overlap the switch, triggering the gates to open.
+3. Confirm that the barricades (color 5 impassable terrain) blocking the goal have converted into passable space (color 0 or 3).
+4. Navigate to the 3x3 goal symbol (made of color 9).
+5. Perfectly align the center 3x3 area of your 5x5 player block exactly over the 3x3 goal footprint. Your block's outer border will extend 1 cell past the goal on all sides.
 
 # Controls
-- Action 1: Move UP (Y decreases by 5 cells)
-- Action 2: Move DOWN (Y increases by 5 cells)
-- Action 3: Move LEFT (X decreases by 5 cells)
-- Action 4: Move RIGHT (X increases by 5 cells)
+- Action 1: UP (Y decreases by 5)
+- Action 2: DOWN (Y increases by 5)
+- Action 3: LEFT (X decreases by 5)
+- Action 4: RIGHT (X increases by 5)
 
 # Key Facts
-- **Player Block:** A 5x5 object (upper two rows are color 12, lower three rows are color 9).
-- **Movement:** Movement occurs in strictly 5-cell jumps.
-- **Timer:** The color 11 bar at the bottom depletes by 2 cells per move. Any wasted moves can lead to game over.
-- **Obstacles:** Color 5 is an impassable wall. You must unlock them using the button.
+- **Player Structure**: A 5x5 block (top two rows are color 12, bottom three are color 9). Moves strictly in 5-cell intervals.
+- **Timer Constraint**: Watch the color 11 blocks at the bottom limit. Two blocks vanish every move. Avoid all unnecessary steps.
+- **Gates**: Color 5 is impassable terrain until triggered.
+- **Goal Completion**: Requires pinpoint alignment of the player block centers, not just touching the goal.
