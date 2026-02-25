@@ -146,7 +146,7 @@ def build_func_resp_prompt(
     sections.append(f"# Step {n_steps + 1} | Actions used: {n_steps}")
 
     # Instruction
-    sections.append("# ACT NOW — call a game action (ACTION1-ACTION6). Then call `update_skill` to record what you learned.")
+    sections.append("# ACT NOW — call a game action (ACTION1-ACTION6). Use `run_code` ONLY when you need pathfinding/analysis. Then call `update_skill` to record what you learned.")
 
     return "\n\n".join(sections)
 
@@ -155,5 +155,6 @@ def build_user_prompt() -> str:
     """Minimal user prompt — strategy comes from skills."""
     return textwrap.dedent("""\
         You are playing an ARC-AGI-3 grid game. Discover the rules yourself.
-        ALWAYS call exactly one tool: ACTION1-ACTION6, load_skill, or update_skill.
+        ALWAYS call exactly one tool: ACTION1-ACTION6, load_skill, update_skill, or run_code.
+        Use run_code ONLY for computation (BFS pathfinding, pattern analysis). Prefer game actions.
     """)

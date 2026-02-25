@@ -92,13 +92,25 @@ class LLM(Agent):
         current_level = getattr(self, "current_level", 1)
         skill_base = Path(__file__).parent / "skills" / f"arc-{self.game_id}"
 
-        # Load current level skill
+        # Load current level skill (agent's working copy)
         level_skill = skill_base / f"level{current_level}" / "SKILL.md"
+        level_base = skill_base / f"level{current_level}" / "SKILL.base.md"
+        skill_content = ""
         if level_skill.is_file():
-            content = level_skill.read_text(encoding="utf-8").strip()
-            if content:
+            skill_content = level_skill.read_text(encoding="utf-8").strip()
+        # Fall back to template if SKILL.md is missing or too short
+        if len(skill_content) < 20 and level_base.is_file():
+            skill_content = level_base.read_text(encoding="utf-8").strip()
+        if skill_content:
+            sections.append(
+                f"## Your Evolved Skill — Level {current_level} (current)\n{skill_content}"
+            )
+        # Always show template separately if it exists and differs from working copy
+        if level_base.is_file():
+            base_content = level_base.read_text(encoding="utf-8").strip()
+            if base_content and base_content != skill_content:
                 sections.append(
-                    f"## Your Evolved Skill — Level {current_level} (current)\n{content}"
+                    f"## Level {current_level} Cheat Sheet (from previous levels — DO NOT lose this info)\n{base_content}"
                 )
 
         # Load previous level skills as reference (most recent first, max 2)

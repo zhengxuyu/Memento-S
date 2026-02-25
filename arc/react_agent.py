@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Hard timeout for API calls (signal.alarm based).
 # httpx read timeout doesn't cover chunked body stalls from OpenRouter.
-_HARD_TIMEOUT = 60  # seconds
+_HARD_TIMEOUT = 15  # seconds
 
 
 class _HardTimeout:
@@ -67,6 +67,7 @@ _GAME_ACTIONS = frozenset({
 _TOOL_HANDLERS = {
     "update_skill": "_handle_update_skill",
     "load_skill": "_handle_load_skill",
+    "run_code": "_handle_run_code",
 }
 
 
@@ -399,6 +400,33 @@ class ReactAgent(LLM):
         logger.warning("SHORTCUT: replayed all %d actions but level %d not completed", len(actions), level)
         return False
 
+    def _archive_skill(self, episode_result: str) -> None:
+        """Copy current skill files to timestamped archive after each episode."""
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        skill_base = Path(__file__).parent / "skills" / f"arc-{self.game_id}"
+
+        # Archive per-level skills that exist
+        for level_dir in sorted(skill_base.glob("level*")):
+            for skill_file in level_dir.glob("SKILL.md"):
+                content = skill_file.read_text(encoding="utf-8").strip()
+                if len(content) < 10:
+                    continue  # skip empty/trivial files
+                archive_name = f"SKILL.{episode_result}.r{self.retry_count}.{ts}.md"
+                archive_path = level_dir / archive_name
+                archive_path.write_text(content, encoding="utf-8")
+                logger.info("Archived %s → %s", skill_file.name, archive_path.name)
+
+        # Archive legacy SKILL.md if it exists
+        legacy = skill_base / "SKILL.md"
+        if legacy.is_file():
+            content = legacy.read_text(encoding="utf-8").strip()
+            if len(content) >= 10:
+                archive_name = f"SKILL.{episode_result}.r{self.retry_count}.{ts}.md"
+                archive_path = skill_base / archive_name
+                archive_path.write_text(content, encoding="utf-8")
+                logger.info("Archived legacy SKILL.md → %s", archive_path.name)
+
     def main(self) -> None:
         self.timer = time.time()
         self._clear_stop()
@@ -406,6 +434,9 @@ class ReactAgent(LLM):
 
         while True:
             result = self._play_episode()
+
+            # Archive skill file after each episode
+            self._archive_skill(result)
 
             if result == "win":
                 if self.episode_memory:
@@ -463,7 +494,9 @@ class ReactAgent(LLM):
             while str(self.current_level) in self._shortcuts:
                 if self._replay_shortcut(self.current_level):
                     # Level completed via shortcut
+                    completed_level = self.current_level
                     self._last_score = self._frame_score(self.frames[-1])
+                    self._force_level_up_summary(completed_level)
                     self.current_level = self._last_score + 1
                     score_at_episode_start = self._last_score
                     self.current_steps = []
@@ -505,11 +538,9 @@ class ReactAgent(LLM):
                     return "win"
                 if latest.state is GameState.GAME_OVER:
                     return "game_over"
-                if MAX_ACTIONS > 0 and step_count >= MAX_ACTIONS:
-                    logger.info("Max actions per level (%d) reached at level %d", MAX_ACTIONS, self.current_level)
-                    return "max_actions"
 
-                # Check if score increased (level completed) — handle inline, no RESET
+                # Check score BEFORE max_actions — if the last action scored,
+                # we must save the shortcut before returning "max_actions"
                 curr_score = self._frame_score(latest)
                 if curr_score > score_at_episode_start:
                     self._last_score = curr_score
@@ -849,6 +880,29 @@ class ReactAgent(LLM):
                 },
             },
         })
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "run_code",
+                "description": (
+                    "Execute Python code for grid analysis, pathfinding (BFS/DFS), or pattern detection. "
+                    "Pre-defined variables: `grid` (current 64x64 grid as 2D list), `grids` (all grids), "
+                    "`score`, `step_count`, `action_history` (list of past actions). "
+                    "Use ONLY when you need computation (e.g. BFS shortest path, counting cells, "
+                    "finding object positions). Do NOT use for simple observations you can do by reading the grid."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "Python code to execute. Use print() for output.",
+                        },
+                    },
+                    "required": ["code"],
+                },
+            },
+        })
         return tools
 
     def _force_skill_update(self) -> None:
@@ -860,15 +914,25 @@ class ReactAgent(LLM):
         latest = self.frames[-1]
         obs = self._build_observation(latest)
 
-        # Load current skill content for context
+        # Load current skill + template for context
+        skill_base = Path(__file__).parent / "skills" / f"arc-{self.game_id}" / f"level{self.current_level}"
         skill_content = ""
-        skill_path = Path(__file__).parent / "skills" / f"arc-{self.game_id}" / f"level{self.current_level}" / "SKILL.md"
+        skill_path = skill_base / "SKILL.md"
         if skill_path.is_file():
             try:
-                with open(skill_path) as f:
-                    skill_content = f.read()
+                skill_content = skill_path.read_text(encoding="utf-8")
             except Exception:
                 pass
+        base_content = ""
+        base_path = skill_base / "SKILL.base.md"
+        if base_path.is_file():
+            try:
+                base_content = base_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        # Use template as fallback if working copy is empty/junk
+        if len(skill_content.strip()) < 20 and base_content:
+            skill_content = base_content
 
         # Build a standalone message list — no shared conversation history
         messages = [
@@ -955,21 +1019,37 @@ class ReactAgent(LLM):
         # Build standalone LLM call
         messages = [
             {"role": "system", "content": (
-                "You are preparing a skill file for the NEXT level of an ARC-AGI-3 grid game. "
-                "The player just completed a level. Based on the previous level's skill file, "
-                "extract the KEY TAKEAWAYS that will help in the next level:\n"
-                "- Confirmed action mappings (movement directions, special actions)\n"
-                "- Core game mechanics (how scoring works, what triggers level completion)\n"
-                "- Object roles (what each color means, buttons, gates, goals)\n"
-                "- Winning strategy pattern (step-by-step what the player must do)\n\n"
-                "Write a NEW skill file in YAML frontmatter + markdown format. "
-                "Focus on REUSABLE knowledge — the next level will have the same mechanics "
-                "but a different layout. Do NOT include coordinates or paths specific to the old level."
+                "You are distilling a CHEAT SHEET for the next level of an ARC-AGI-3 grid game. "
+                "The next level has the SAME mechanics but a DIFFERENT layout.\n\n"
+                "Write a CONCISE, ACTIONABLE skill file. Use this EXACT structure:\n\n"
+                "```\n"
+                "---\n"
+                "name: \"<short name>\"\n"
+                "description: \"<one line>\"\n"
+                "---\n"
+                "# How To Win (step-by-step)\n"
+                "1. <first thing to do>\n"
+                "2. <second thing to do>\n"
+                "...\n\n"
+                "# Controls\n"
+                "- Action 1: <what it does>\n"
+                "...\n\n"
+                "# Key Facts\n"
+                "- <critical fact 1>\n"
+                "- <critical fact 2>\n"
+                "...\n"
+                "```\n\n"
+                "Rules:\n"
+                "- 'How To Win' is the MOST IMPORTANT section. Be specific: what to find, "
+                "what to interact with, what triggers level completion.\n"
+                "- NO coordinates from the old level (layout will be different).\n"
+                "- NO filler or generic advice. Every line must be a concrete, tested fact.\n"
+                "- Keep it SHORT — under 800 words."
             )},
             {"role": "user", "content": (
-                f"# Completed Level {completed_level} Skill File:\n```\n{prev_content}\n```\n\n"
-                f"Call update_skill with a skill file for Level {new_level}. "
-                "Include all confirmed mechanics and the winning strategy pattern."
+                f"# Level {completed_level} Skill (just completed):\n```\n{prev_content}\n```\n\n"
+                f"Distill this into a cheat sheet for Level {new_level}. "
+                "Focus on the WINNING PROCEDURE — what exactly must the player do to score?"
             )},
         ]
 
@@ -1021,11 +1101,21 @@ class ReactAgent(LLM):
         message = response.choices[0].message
         if message.tool_calls:
             tc = message.tool_calls[0]
-            # Temporarily switch to new level for writing
-            self.current_level = new_level
-            result = self._handle_update_skill(tc.function.arguments or "{}")
-            self.current_level = saved_level
-            logger.info("Level-up summary written for level %d: %s", new_level, result)
+            try:
+                data = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                data = {}
+            content = data.get("content", "")
+            if content and len(content.strip()) > 10:
+                # Write to SKILL.base.md (template — never overwritten by agent)
+                base_dir = skill_base / f"level{new_level}"
+                base_dir.mkdir(parents=True, exist_ok=True)
+                base_path = base_dir / "SKILL.base.md"
+                base_path.write_text(content, encoding="utf-8")
+                logger.info("Level-up template written for level %d: %s (%d chars)",
+                            new_level, base_path, len(content))
+            else:
+                logger.warning("Level-up summary: content too short (%d chars)", len(content))
         else:
             logger.warning("Level-up summary: LLM did not return tool call")
 
@@ -1036,12 +1126,31 @@ class ReactAgent(LLM):
         except json.JSONDecodeError:
             return "Error: invalid JSON"
         content = data.get("content", "")
-        if not content:
-            return "Error: empty content"
+        if not content or len(content.strip()) < 10:
+            return "Error: content too short, must be at least 10 chars"
 
         skill_dir = Path(__file__).parent / "skills" / f"arc-{self.game_id}" / f"level{self.current_level}"
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_path = skill_dir / "SKILL.md"
+
+        # Protect against content regression — don't overwrite good content with junk
+        if skill_path.is_file():
+            old = skill_path.read_text(encoding="utf-8")
+            if len(old) > 200 and len(content) < len(old) * 0.3:
+                logger.warning("Skill update rejected: new (%d chars) is <30%% of old (%d chars)",
+                               len(content), len(old))
+                return (f"Error: update rejected — new content ({len(content)} chars) "
+                        f"is too short compared to existing ({len(old)} chars). "
+                        "Include ALL existing knowledge plus new discoveries.")
+            # Backup old skill before overwriting
+            if len(old.strip()) >= 10:
+                from datetime import datetime
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                step = len(self.current_steps)
+                backup_name = f"SKILL.step{step}.{ts}.md"
+                (skill_dir / backup_name).write_text(old, encoding="utf-8")
+                logger.info("Skill backup: %s", backup_name)
+
         skill_path.write_text(content, encoding="utf-8")
         logger.info("Skill updated (level %d): %s (%d chars)", self.current_level, skill_path, len(content))
         return f"Skill saved for level {self.current_level} ({len(content)} chars)"
