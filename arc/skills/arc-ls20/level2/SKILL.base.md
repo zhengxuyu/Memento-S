@@ -1,23 +1,21 @@
 ---
-name: "Button & Gate Alignment"
-description: "Navigate a 5x5 block to step on switches to open gates, then precisely align over a 3x3 goal before time runs out."
+name: "Button and Gates"
+description: "Step on a button to open a path to the goal, then perfectly frame the goal to win."
 ---
-
 # How To Win (step-by-step)
-1. Locate the switch mechanism (small cluster of colors 0 and 1).
-2. Move the 5x5 player block to overlap the switch, triggering the gates to open.
-3. Confirm that the barricades (color 5 impassable terrain) blocking the goal have converted into passable space (color 0 or 3).
-4. Navigate to the 3x3 goal symbol (made of color 9).
-5. Perfectly align the center 3x3 area of your 5x5 player block exactly over the 3x3 goal footprint. Your block's outer border will extend 1 cell past the goal on all sides.
+1. Locate the small, cross-shaped button.
+2. Move the player block to stand directly on the button, aligning perfectly with its 5x5 grid cell. This triggers a change in the level, opening a new path.
+3. Find the 3x3 goal symbol in the newly accessible area.
+4. Position the 5x5 player block to perfectly surround the 3x3 goal. The goal must be centered inside your block.
 
 # Controls
-- Action 1: UP (Y decreases by 5)
-- Action 2: DOWN (Y increases by 5)
-- Action 3: LEFT (X decreases by 5)
-- Action 4: RIGHT (X increases by 5)
+- Move UP: 5 cells
+- Move DOWN: 5 cells
+- Move LEFT: 5 cells
+- Move RIGHT: 5 cells
 
 # Key Facts
-- **Player Structure**: A 5x5 block (top two rows are color 12, bottom three are color 9). Moves strictly in 5-cell intervals.
-- **Timer Constraint**: Watch the color 11 blocks at the bottom limit. Two blocks vanish every move. Avoid all unnecessary steps.
-- **Gates**: Color 5 is impassable terrain until triggered.
-- **Goal Completion**: Requires pinpoint alignment of the player block centers, not just touching the goal.
+- You control a 5x5 block. All movement is in 5-cell increments.
+- Winning requires precise alignment. Both activating the button and capturing the goal require your block to be perfectly centered on the target's 5x5 grid cell.
+- Walkable terrain is typically light grey (color 3) or black (color 0).
+- Obstacles are typically red (color 4) or dark blue (color 5).

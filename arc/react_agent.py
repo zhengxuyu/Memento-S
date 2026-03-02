@@ -8,6 +8,7 @@ The agent discovers everything through:
 """
 from __future__ import annotations
 
+import ast
 import io
 import json
 import logging
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Hard timeout for API calls (signal.alarm based).
 # httpx read timeout doesn't cover chunked body stalls from OpenRouter.
-_HARD_TIMEOUT = 15  # seconds
+_HARD_TIMEOUT = 60  # seconds
 
 
 class _HardTimeout:
@@ -67,7 +68,7 @@ _GAME_ACTIONS = frozenset({
 _TOOL_HANDLERS = {
     "update_skill": "_handle_update_skill",
     "load_skill": "_handle_load_skill",
-    "run_code": "_handle_run_code",
+    # "run_code": "_handle_run_code",  # disabled to reduce token waste
 }
 
 
@@ -367,7 +368,12 @@ class ReactAgent(LLM):
         return {}
 
     def _save_shortcut(self, level: int, actions: list[str]) -> None:
-        """Save the winning action sequence for a level."""
+        """Save the winning action sequence for a level (only if shorter)."""
+        existing = self._shortcuts.get(str(level))
+        if existing and len(existing) <= len(actions):
+            logger.info("Shortcut not updated: level %d existing (%d) <= new (%d)",
+                        level, len(existing), len(actions))
+            return
         self._shortcuts[str(level)] = actions
         try:
             self._shortcut_file.parent.mkdir(parents=True, exist_ok=True)
@@ -527,7 +533,9 @@ class ReactAgent(LLM):
 
         step_count = 0
         consecutive_tool_calls = 0
+        consecutive_nones = 0
         MAX_CONSECUTIVE_TOOLS = 3
+        MAX_CONSECUTIVE_NONES = 5
         skip_obs = False  # True after tool calls — go straight to LLM, no env call
         while True:
             if not skip_obs:
@@ -584,11 +592,12 @@ class ReactAgent(LLM):
                 action_result = self._llm_step("")
 
             if action_result:
-                tc_name, tc_args, tc_id = action_result
+                consecutive_nones = 0
+                tc_name, tc_args, tc_id, reasoning = action_result
                 self._latest_tool_call_id = tc_id
                 # Route action
                 if tc_name in _GAME_ACTIONS:
-                    self._execute_action(tc_name, tc_args)
+                    self._execute_action(tc_name, tc_args, reasoning=reasoning)
                     step_count += 1
                     consecutive_tool_calls = 0
                     # Force update_skill every 5 actions (independent LLM call)
@@ -600,12 +609,14 @@ class ReactAgent(LLM):
                 elif tc_name in _TOOL_HANDLERS:
                     consecutive_tool_calls += 1
                     if consecutive_tool_calls > MAX_CONSECUTIVE_TOOLS:
-                        logger.info("Too many consecutive tool calls (%d), forcing game action", consecutive_tool_calls)
+                        logger.warning("Too many consecutive tool calls (%d), forcing observation rebuild", consecutive_tool_calls)
                         self.push_message({
                             "role": "tool",
                             "tool_call_id": tc_id,
-                            "content": "Tool limit reached — you must call a game action (ACTION1-ACTION6) now.",
+                            "content": "STOP using tools. You MUST call a game action (ACTION1-ACTION6) NOW.",
                         })
+                        consecutive_tool_calls = 0
+                        skip_obs = False  # Force rebuild observation to break the loop
                     else:
                         handler = getattr(self, _TOOL_HANDLERS[tc_name])
                         result = handler(tc_args)
@@ -614,7 +625,7 @@ class ReactAgent(LLM):
                             "tool_call_id": tc_id,
                             "content": result,
                         })
-                    skip_obs = True  # Don't call env, go straight to LLM
+                        skip_obs = True  # Don't call env, go straight to LLM
                 else:
                     logger.warning("Invalid action: %s", tc_name)
                     self.push_message({
@@ -624,8 +635,14 @@ class ReactAgent(LLM):
                     })
                     skip_obs = True  # Don't call env, let LLM retry
             else:
-                # LLM returned None (no action) — don't rebuild observation, frame hasn't changed
-                skip_obs = True
+                # LLM returned None (no action)
+                consecutive_nones += 1
+                if consecutive_nones >= MAX_CONSECUTIVE_NONES:
+                    logger.warning("LLM returned None %d times in a row — resending observation", consecutive_nones)
+                    consecutive_nones = 0
+                    skip_obs = False  # Force rebuild observation to unstick
+                else:
+                    skip_obs = True
 
     # ------------------------------------------------------------------
     # Observation
@@ -650,6 +667,8 @@ class ReactAgent(LLM):
             max_actions=MAX_ACTIONS,
         )
 
+        function_catalog = ""  # run_code disabled
+
         return build_func_resp_prompt(
             latest_frame=latest,
             frames=self.frames,
@@ -660,6 +679,7 @@ class ReactAgent(LLM):
             action_history=action_history,
             few_shot=few_shot,
             thinking_tools=thinking_tools,
+            function_catalog=function_catalog,
         )
 
     def _build_action_history(self, n: int = 10) -> str:
@@ -672,6 +692,31 @@ class ReactAgent(LLM):
             lines.append(f"  {i+1}. {step.get('action', '?')} -> {step.get('effect', '?')}")
         return "\n".join(lines)
 
+    def _get_function_catalog(self) -> str:
+        """Return a catalog of saved functions for prompt injection."""
+        func_dir = Path(__file__).parent / "skills" / f"arc-{self.game_id}" / "functions"
+        if not func_dir.is_dir():
+            return ""
+        entries = []
+        for py_file in sorted(func_dir.glob("*.py")):
+            fname = py_file.stem
+            try:
+                content = py_file.read_text(encoding="utf-8")
+                tree = ast.parse(content)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef):
+                        args = ", ".join(a.arg for a in node.args.args)
+                        doc = ast.get_docstring(node) or fname
+                        entries.append(f"- `{fname}({args})`: {doc}")
+                        break
+                else:
+                    entries.append(f"- `{fname}()`: (no signature found)")
+            except Exception:
+                entries.append(f"- `{fname}()`: (parse error)")
+        if not entries:
+            return ""
+        return "# Available Functions (pre-loaded in run_code)\n" + "\n".join(entries)
+
     # ------------------------------------------------------------------
     # LLM call
     # ------------------------------------------------------------------
@@ -680,6 +725,29 @@ class ReactAgent(LLM):
     _ACTION_NAMES = frozenset({
         "ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "RESET",
     })
+
+    @staticmethod
+    def _is_funds_error(exc: Exception) -> bool:
+        """Check if an API error is due to insufficient funds/credits."""
+        msg = str(exc).lower()
+        if any(kw in msg for kw in ("insufficient", "funds", "credits", "payment", "billing", "quota")):
+            return True
+        if hasattr(exc, "status_code") and exc.status_code == 402:
+            return True
+        return False
+
+    def _create_completion(self, client: Any, **kwargs: Any) -> Any:
+        """Wrapper: chat.completions.create with infinite retry on insufficient funds."""
+        while True:
+            try:
+                with _HardTimeout():
+                    return client.chat.completions.create(**kwargs)
+            except Exception as e:
+                if self._is_funds_error(e):
+                    logger.warning("Insufficient funds — waiting 60s before retry: %s", e)
+                    time.sleep(60)
+                    continue
+                raise
 
     def _parse_action_from_text(self, text: str) -> Optional[str]:
         """Try to extract an action name from reasoning text.
@@ -693,7 +761,7 @@ class ReactAgent(LLM):
             return m.group(1)
         return None
 
-    def _llm_step(self, observation: str) -> Optional[tuple[str, str, str]]:
+    def _llm_step(self, observation: str) -> Optional[tuple[str, str, str, str]]:
         """Single LLM call: observation → reasoning + action.
 
         Strategy:
@@ -702,7 +770,7 @@ class ReactAgent(LLM):
         3. If only reasoning, parse action name from text (fast, no API call)
         4. If parsing fails, fall back to Phase 2 with tool_choice="required"
 
-        Returns (tool_name, tool_args_json, tool_call_id) or None.
+        Returns (tool_name, tool_args_json, tool_call_id, reasoning) or None.
         """
         # Push observation as tool response
         if observation:
@@ -736,8 +804,7 @@ class ReactAgent(LLM):
                 if extra:
                     create_kwargs["extra_body"] = extra
 
-                with _HardTimeout():
-                    response = client.chat.completions.create(**create_kwargs)
+                response = self._create_completion(client, **create_kwargs)
                 break
             except openai.BadRequestError:
                 logger.warning("BadRequestError on attempt %d", attempt + 1)
@@ -759,6 +826,12 @@ class ReactAgent(LLM):
         message = response.choices[0].message
 
         reasoning = message.content or ""
+        # OpenRouter returns thinking/reasoning in a separate field
+        reasoning_content = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None) or ""
+        if reasoning_content and not reasoning:
+            reasoning = reasoning_content
+        elif reasoning_content and reasoning:
+            reasoning = f"[Thinking] {reasoning_content}\n\n{reasoning}"
         if reasoning:
             logger.info("LLM reasoning: %s", reasoning[:300])
 
@@ -782,7 +855,7 @@ class ReactAgent(LLM):
                         "function": {"name": parsed_action, "arguments": "{}"},
                     }],
                 })
-                return (parsed_action, "{}", tc_id)
+                return (parsed_action, "{}", tc_id, reasoning)
 
             # Phase 2 fallback: no action parseable, force tool call
             self.push_message({"role": "assistant", "content": reasoning})
@@ -799,8 +872,7 @@ class ReactAgent(LLM):
                     extra = self._extra_body
                     if extra:
                         create_kwargs["extra_body"] = extra
-                    with _HardTimeout():
-                        response = client.chat.completions.create(**create_kwargs)
+                    response = self._create_completion(client, **create_kwargs)
                     break
                 except (openai.BadRequestError, openai.APIConnectionError,
                         openai.RateLimitError, openai.APITimeoutError,
@@ -823,7 +895,7 @@ class ReactAgent(LLM):
 
         return None
 
-    def _process_tool_calls(self, message: Any, reasoning: str) -> Optional[tuple[str, str, str]]:
+    def _process_tool_calls(self, message: Any, reasoning: str) -> Optional[tuple[str, str, str, str]]:
         """Process tool calls from LLM response."""
         if message.tool_calls:
             tc = message.tool_calls[0]
@@ -832,6 +904,7 @@ class ReactAgent(LLM):
                 tc.function.name,
                 tc.function.arguments or "{}",
                 tc.id,
+                reasoning,
             )
         return None
 
@@ -880,29 +953,7 @@ class ReactAgent(LLM):
                 },
             },
         })
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": "run_code",
-                "description": (
-                    "Execute Python code for grid analysis, pathfinding (BFS/DFS), or pattern detection. "
-                    "Pre-defined variables: `grid` (current 64x64 grid as 2D list), `grids` (all grids), "
-                    "`score`, `step_count`, `action_history` (list of past actions). "
-                    "Use ONLY when you need computation (e.g. BFS shortest path, counting cells, "
-                    "finding object positions). Do NOT use for simple observations you can do by reading the grid."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {
-                            "type": "string",
-                            "description": "Python code to execute. Use print() for output.",
-                        },
-                    },
-                    "required": ["code"],
-                },
-            },
-        })
+        # run_code disabled to reduce token waste
         return tools
 
     def _force_skill_update(self) -> None:
@@ -970,8 +1021,7 @@ class ReactAgent(LLM):
                 extra = self._extra_body
                 if extra:
                     create_kwargs["extra_body"] = extra
-                with _HardTimeout():
-                    response = client.chat.completions.create(**create_kwargs)
+                response = self._create_completion(client, **create_kwargs)
                 break
             except (openai.BadRequestError, openai.APIConnectionError,
                     openai.RateLimitError, openai.APITimeoutError,
@@ -1078,8 +1128,7 @@ class ReactAgent(LLM):
                 extra = self._extra_body
                 if extra:
                     create_kwargs["extra_body"] = extra
-                with _HardTimeout():
-                    response = client.chat.completions.create(**create_kwargs)
+                response = self._create_completion(client, **create_kwargs)
                 break
             except (openai.BadRequestError, openai.APIConnectionError,
                     openai.RateLimitError, openai.APITimeoutError,
@@ -1233,6 +1282,16 @@ class ReactAgent(LLM):
         safe_builtins["__import__"] = _restricted_import
         namespace["__builtins__"] = safe_builtins
 
+        # Pre-load saved functions into namespace
+        func_dir = Path(__file__).parent / "skills" / f"arc-{self.game_id}" / "functions"
+        if func_dir.is_dir():
+            for py_file in sorted(func_dir.glob("*.py")):
+                try:
+                    func_code = py_file.read_text(encoding="utf-8")
+                    exec(func_code, namespace)
+                except Exception as e:
+                    logger.warning("Failed to load function %s: %s", py_file.name, e)
+
         # Capture stdout
         stdout_capture = io.StringIO()
         result_container: list[str] = []
@@ -1258,6 +1317,26 @@ class ReactAgent(LLM):
         if thread.is_alive():
             return "Error: code execution timed out (5s limit)"
 
+        # Extract and persist user-defined functions
+        if not error_container:
+            try:
+                func_dir.mkdir(parents=True, exist_ok=True)
+                tree = ast.parse(code)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef):
+                        fname = node.name
+                        if fname.startswith("_"):
+                            continue
+                        lines = code.split("\n")
+                        func_source = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+                        docstring = ast.get_docstring(node) or ""
+                        func_path = func_dir / f"{fname}.py"
+                        header = f'"""{docstring}"""\n' if docstring else ""
+                        func_path.write_text(header + func_source + "\n", encoding="utf-8")
+                        logger.info("Saved function: %s -> %s", fname, func_path.name)
+            except Exception as e:
+                logger.warning("Function extraction failed: %s", e)
+
         output = result_container[0] if result_container else ""
         if error_container:
             output += f"\n[ERROR] {error_container[0]}"
@@ -1274,7 +1353,7 @@ class ReactAgent(LLM):
     # Action execution
     # ------------------------------------------------------------------
 
-    def _execute_action(self, name: str, args_json: str) -> None:
+    def _execute_action(self, name: str, args_json: str, reasoning: str = "") -> None:
         """Execute one game action and record the step."""
         try:
             data = json.loads(args_json) if args_json else {}
@@ -1283,6 +1362,10 @@ class ReactAgent(LLM):
 
         action = GameAction.from_name(name)
         action.set_data(data)
+
+        # Attach reasoning so it gets sent to the API / scorecard
+        if reasoning:
+            action.reasoning = {"content": reasoning}
 
         # Pre-action state
         prev_frame = self.frames[-1]
@@ -1313,11 +1396,23 @@ class ReactAgent(LLM):
             effect += f" +{score_delta} score"
 
         # Record step
-        self.current_steps.append({
+        step_record = {
             "action": name,
             "effect": effect,
             "score": curr_score,
-        })
+        }
+        if reasoning:
+            step_record["reasoning"] = reasoning
+        self.current_steps.append(step_record)
+
+        # Record reasoning to JSONL recording
+        if reasoning and hasattr(self, "recorder"):
+            self.recorder.record({
+                "type": "reasoning",
+                "step": self.action_counter,
+                "action": name,
+                "reasoning": reasoning,
+            })
 
         logger.info(
             "%s: %s -> %s (score %d->%d, action #%d)",

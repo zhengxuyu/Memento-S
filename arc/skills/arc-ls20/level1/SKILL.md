@@ -1,27 +1,27 @@
 ---
 name: "Button and Gates"
-description: "Game involves navigating a 5x5 block, stepping on button-like objects to change the level layout, and perfectly aligning over a 3x3 goal."
+description: "Navigate a 5x5 player block around obstacles to step on a button, which opens the gate to the 3x3 goal, then navigate inside the open gate to perfectly enclose the goal."
 ---
 
 # Game Mechanics
-- We control a 5x5 block consisting of two top rows of color 12 and three bottom rows of color 9.
-- Action 1: UP (Y decreases by 5)
-- Action 2: DOWN (Y increases by 5)
-- Action 3: LEFT (X decreases by 5)
-- Action 4: RIGHT (X increases by 5)
+- Played on a 64x64 grid.
+- We control a 5x5 player block (top 2 rows color 12, bottom 3 rows color 9). Movement is exactly 5 cells per action.
+- Walkable area is primarily color 3 and color 0. Colors 4 and 5 are obstacles. 
+- Action 1: UP (Y -= 5)
+- Action 2: DOWN (Y += 5) 
+- Action 3: LEFT (X -= 5)
+- Action 4: RIGHT (X += 5)
+- Every valid map move costs 1 action. The timer (represented by groups of color 11 blocks, typically pairs) resides at the bottom right. It decreases with every move. When the timer runs out, the episode ends (max_actions). Action 5 and 6 do nothing.
 
 # Game Elements
-- **Player Block**: A 5x5 matrix at the current position.
-- **Timer**: Color 11 at the bottom. Two blocks vanish every move. Do not waste moves!
-- **Button / Key**: Objects made of color 0 and 1 arranged in a small complex. When the player steps on (overlaps) these objects, they act as switches, unlocking pathways.
-- **Gates / Obstacles**: Color 5 acts as impassable terrain. Stepping on the button "unlocks" areas of color 5 near the goal by turning them into passable color 0 or 3.
-- **Goal**: A 3x3 symbol made of color 9 on the grid. 
-- **Alignment**: To complete a level, perfectly align the **center 3x3 cells of the 5x5 player block** precisely over the 3x3 goal footprint. This means the boundaries of the 5x5 block will extend 1 cell past the 3x3 in all directions.
+- **Button / Key**: A small cross-shape object (colors 0 and 1) typically occupying a 3x3 bounding box. It sits inside a walkable 5x5 grid cell. Standing on the button (aligning the player's 5x5 square exactly over the 5x5 area containing the button) activates it.
+- **Goal Symbol**: A 3x3 symbol of color 9. It might have missing pieces, but its bounding box is 3x3. The objective is to flawlessly overlap the player's 5x5 block around this 3x3 bounding rectangle.
+- **Gates & Mechanisms**: Initially, the goal is often protected by a structural gate of color 5 (or 4). Stepping on the button transforms this gate into walkable terrain (color 0 or 3), effectively "opening" the gate. In other instances, buttons toggle mechanical structures elsewhere on the grid (e.g., swapping solid segments of color 5 and 9 to open new pathways).
+- **Alignment**: The player moves on a strict 5x5 grid spacing. Both the button and the goal exist centered within their respective 5x5 cells. For example, to perfectly cover a goal/button situated at (y+1, x+1)..(y+3, x+3), the player's 5x5 top-left must land at exactly (y,x). 
 
 # Strategy
-1. Locate the button (small complex of colors 0 and 1).
-2. Move the player block onto the button to trigger a level change.
-3. Observe what was unlocked (usually a region of impassable color 5 around the color 9 goal symbol).
-4. Navigate to the goal.
-5. Perfectly align the 5x5 player block so it covers the 3x3 goal completely (the centers must match).
-6. The level will reset and progress will continue. Keep moving!
+1. **Locate the Button**: Find the button (e.g., color 0 or 1 cross in the environment). 
+2. **Find Path to Button**: Traverse strictly on walkable terrain (color 3 or color 0) dodging obstacles (colors 4 and 5) in multiples of 5x5.
+3. **Activate Mechanism**: Move the player block completely ONTO the button to align their centers, which opens the gate or toggles obstacles. The game grid will change, often updating remote cells (e.g. 5->9 or 9->5) to grant access to the goal.
+4. **Find Path to Goal**: Once the barrier is removed, navigate OFF the button and toward the goal. Ensure movements strictly follow 5x5 increments.
+5. **Enclose perfectly**: The player's 5x5 bounding block must overlap the goal coordinates precisely (i.e., if goal bounding box is 11-13y, 35-37x, player top-left must end perfectly at 10y, 34x) to trigger the level_up sequence and secure the score.

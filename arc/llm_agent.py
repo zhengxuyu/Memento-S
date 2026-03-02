@@ -42,10 +42,13 @@ class LLM(Agent):
 
     @property
     def _extra_body(self) -> dict[str, Any] | None:
+        body: dict[str, Any] = {}
         provider = os.environ.get("OPENROUTER_PROVIDER", "").strip()
         if provider:
-            return {"provider": {"order": [provider]}}
-        return None
+            body["provider"] = {"order": [provider]}
+        # Request reasoning/thinking from models that support it
+        body["include_reasoning"] = True
+        return body or None
 
     def _get_system_prompt(self) -> str:
         """Build system prompt with ARC game context and any loaded skills."""

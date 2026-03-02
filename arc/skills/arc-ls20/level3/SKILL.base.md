@@ -1,23 +1,21 @@
 ---
-name: "Scrolling Mechanics and Level Objects"
-description: "Navigate a 5x5 block, trigger buttons to open gates, and perfectly center over a 3x3 goal before the timer expires."
+name: "ARC-AGI-3 Core Mechanics"
+description: "Find and activate the button to open the path to the final goal."
 ---
 # How To Win (step-by-step)
-1. Locate the button, identifying it as a small complex made of colors 0 and 1.
-2. Move the player block onto the button to trigger it. This will open the gate by changing impassable walls (color 5) into passable terrain (colors 0 or 3).
-3. Navigate efficiently towards the 3x3 goal symbol (color 9). Every move depletes the timer, so minimize wasted steps or dead ends.
-4. Perfectly align the center 3x3 cells of your 5x5 player block over the 3x3 goal footprint.
-5. Once aligned, perform 1 or 2 extra actions (like repeating the last movement into a wall) to force the game to register the alignment and complete the level.
+1. Scan the grid to locate the 'button' structure.
+2. Navigate the 5x5 player block to perfectly cover the button. This will change the level layout, opening a new path.
+3. Locate the now-accessible U-shaped 'goal' structure.
+4. Pathfind a route for the player block to the goal.
+5. Position the 5x5 player block to perfectly cover the 3x3 goal structure to win.
 
 # Controls
-- Action 1: Move UP (moves exactly 5 cells)
-- Action 2: Move DOWN (moves exactly 5 cells)
-- Action 3: Move LEFT (moves exactly 5 cells)
-- Action 4: Move RIGHT (moves exactly 5 cells)
+- Action 1: Move UP (Y -= 5)
+- Action 2: Move DOWN (Y += 5)
+- Action 3: Move LEFT (X -= 5)
+- Action 4: Move RIGHT (X += 5)
 
 # Key Facts
-- The player avatar is a 5x5 block and moves by exactly its own width/height per action, effectively snapping to a 5x5 grid.
-- The timer (color 11 at screen bottom) depletes by exactly 2 cells per action. Depleting it fully results in a time out and a life lost.
-- Movement into obstacles (color 5 walls) is blocked. Your position will not change, but the timer will still deplete.
-- Moving near the screen boundaries causes the environment to scroll.
-- Remaining lives are shown as small 2x2 blocks of color 8 at the bottom right.
+- The player is a 5x5 block and all movement is in 5-cell increments.
+- A strict, global action limit is always active. Wasting moves by hitting walls will likely cause you to fail.
+- Interacting with objects (buttons, goals) requires the 5x5 player block to be positioned perfectly over them.

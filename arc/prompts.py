@@ -79,6 +79,7 @@ def build_func_resp_prompt(
     action_history: str = "",
     few_shot: str = "",
     thinking_tools: str = "",
+    function_catalog: str = "",
 ) -> str:
     """Build the observation prompt — raw game state + few-shot + thinking tools."""
     sections: list[str] = []
@@ -90,6 +91,10 @@ def build_func_resp_prompt(
     # Situation-based thinking tools
     if thinking_tools:
         sections.append(thinking_tools)
+
+    # Saved function catalog (available in run_code)
+    if function_catalog:
+        sections.append(function_catalog)
 
     # Game state with level info
     score = getattr(latest_frame, "score", latest_frame.levels_completed)

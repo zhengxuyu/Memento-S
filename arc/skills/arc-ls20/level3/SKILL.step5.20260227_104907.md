@@ -1,0 +1,27 @@
+---
+name: "Level 1, 2, & 3 Game Mechanics, Pathing and Strategies"
+description: "Navigating Level 3: Moving UP left corridor. Currently at Y=20."
+---
+
+# Game Mechanics
+- **Player Avatar**: A 5x5 block (top 2 rows color 12, bottom 3 rows color 9).
+- **Fog of War**: Moving into unrevealed areas clears color 4.
+- **Action Mappings**: 
+  - ACTION1: Move UP (Y - 5)
+  - ACTION2: Move DOWN (Y + 5)
+  - ACTION3: Move LEFT (X - 5)
+  - ACTION4: Move RIGHT (X + 5)
+- **Timer**: Episodic global limit of 100 actions. Color 11 at bottom depletes by 2 cells per action.
+
+# Level 3 Route Info
+- Start: (45,9)
+- Currently taking continuous ACTION1 to move UP. At Y=20, X=9.
+- Target is Y=10 (2 more UP moves required to reach Y=10).
+- From Y=10, proceed RIGHT (ACTION4) x 8 towards the button to reach X=49.
+- Button: Covers (11-13, 50-52). Target player pos: (10,49) precisely aligns the button within the avatar.
+- Goal: Covers (51-53, 55-57). Target player pos: (50,54).
+
+# Strategy to Win 
+1. Strict 5x5-aligned moves avoiding obstacle walls (color 5).
+2. Move over the 3x3 button (0/1 colors) to open the gate.
+3. Path perfectly to goal and center player block over the 3x3 U-shaped goal (color 9).
