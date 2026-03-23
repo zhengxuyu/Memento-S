@@ -23,7 +23,7 @@ class LLM(Agent):
     REASONING_EFFORT: Optional[str] = None
     MODEL_REQUIRES_TOOLS: bool = False
     MESSAGE_LIMIT: int = 10
-    MODEL: str = "qwen/qwen3.5-397b-a17b"
+    MODEL: str = "openai/gpt-5.4-mini"
     messages: list[dict[str, Any]]
     token_counter: int
 
@@ -46,54 +46,53 @@ class LLM(Agent):
         provider = os.environ.get("OPENROUTER_PROVIDER", "").strip()
         if provider:
             body["provider"] = {"order": [provider]}
-        # Request reasoning/thinking from models that support it
-        body["include_reasoning"] = True
+        # Request reasoning/thinking from models that support it (not GPT)
+        if not self._model.startswith("openai/"):
+            body["include_reasoning"] = True
         return body or None
 
     def _get_system_prompt(self) -> str:
         """Build system prompt with ARC game context and any loaded skills."""
         sections: list[str] = []
 
-        # Core ARC game context (always present)
+        # Core ARC game context
         sections.append(
-            "# ARC-AGI-3 Game Playing\n\n"
-            "You are playing an **unknown** dynamic grid-based game. "
-            "Nothing is told to you — discover everything through observation and experimentation.\n\n"
-            "## Game Basics\n"
-            "- **Grid**: One or more 64x64 matrices, cell values 0-15 (colors).\n"
-            "- **Actions**: RESET, ACTION1-ACTION6. Their meanings vary per game.\n"
-            "- **States**: PLAYING -> WIN or GAME_OVER.\n"
-            "- **Score**: Score increase = level completed. Goal is WIN (beat all levels).\n"
-            "- **Budget**: Every action costs a turn. Don't waste moves.\n\n"
-            "## Level Structure (CRITICAL)\n"
-            "- Each game has **multiple levels**. Score = levels completed.\n"
-            "- When you complete a level (score +1), the grid resets to a new layout for the next level.\n"
-            "- **IMPORTANT: Later levels INHERIT and BUILD ON the winning conditions of earlier levels.**\n"
-            "  The core mechanics (movement, interactions) stay the same, but the puzzle layout changes.\n"
-            "- Once you figure out HOW to score on level 1, apply the same strategy to later levels.\n"
-            "- Update your skill file after EACH level to record what worked.\n\n"
-            "## Your Loop (STRICT — follow every step)\n"
-            "1. **Observe**: What changed? Did the grid change? Did score change?\n"
-            "2. **Act**: Call ONE game action (ACTION1-ACTION6).\n"
-            "3. **Update skill**: Call `update_skill` to record what you learned.\n"
-            "Every turn alternates: game action → update_skill → game action → update_skill ...\n\n"
-            "## MANDATORY: Evolve a Skill\n"
-            "You MUST create and continuously update a skill file to persist your discoveries.\n"
-            f"- **Tool**: Call `update_skill` with full SKILL.md content (saved per-level for game `{self.game_id}`)\n"
-            "- **What to record**: action mappings, scoring rules, grid patterns, winning strategies\n"
-            "- **When to update**: after each discovery (score change, new pattern, failed hypothesis)\n"
-            "- **Format**: YAML frontmatter (name, description) + markdown body\n"
-            "- **Why**: Without a skill file, your knowledge dies with this episode. "
-            "Future agents inherit ONLY what you write to the skill file.\n"
-            "This is NOT optional. Every insight you don't persist is lost forever."
+            "# ARC-AGI-3 Game\n\n"
+            "Unknown grid game. Discover rules by observation.\n"
+            "- Grid: 64x64, values 0-15 (colors). Actions: ACTION1-ACTION6.\n"
+            "- Score increase = level completed. Same mechanics, new layout each level.\n"
+            "- Every action costs a turn. Don't waste moves.\n"
+            f"- Call `update_skill` to persist discoveries (game `{self.game_id}`). Knowledge dies without it."
         )
 
-        # Skills are injected per-step via skill_selector (situation-based),
-        # not loaded all at once here.
+        # Spatial reasoning — compact
+        spatial = getattr(self, '_spatial', None)
+        if spatial and spatial.state == "enabled":
+            size = spatial.player_size
+            disp_str = ", ".join(
+                f"{a}: ({dr},{dc})" for a, (dr, dc) in sorted(spatial.confirmed_displacements.items())
+            )
+            wall_str = str(set(spatial.confirmed_walls)) if spatial.confirmed_walls else "unknown"
+            sections.append(
+                f"## Spatial Model: player {size[0]}x{size[1]}, steps: {disp_str}, walls: {wall_str}"
+            )
+        sections.append(
+            "## Navigation: locate yourself (Y,X), identify target, scan for walls, move toward target. "
+            "If no_effect → you hit a wall, try a different direction."
+        )
 
         # Load existing evolved skills for this game (per-level, from previous episodes)
         current_level = getattr(self, "current_level", 1)
         skill_base = Path(__file__).parent / "skills" / f"arc-{self.game_id}"
+
+        # Load game-wide facts (always, never truncated)
+        facts_path = skill_base / "FACTS.md"
+        if facts_path.is_file():
+            facts_content = facts_path.read_text(encoding="utf-8").strip()
+            if facts_content:
+                sections.append(
+                    "## Universal Game Knowledge (CRITICAL — these facts apply to ALL levels)\n" + facts_content
+                )
 
         # Load current level skill (agent's working copy)
         level_skill = skill_base / f"level{current_level}" / "SKILL.md"
@@ -106,46 +105,10 @@ class LLM(Agent):
             skill_content = level_base.read_text(encoding="utf-8").strip()
         if skill_content:
             sections.append(
-                f"## Your Evolved Skill — Level {current_level} (current)\n{skill_content}"
+                f"## Your Evolved Skill — Level {current_level}\n{skill_content}"
             )
-        # Always show template separately if it exists and differs from working copy
-        if level_base.is_file():
-            base_content = level_base.read_text(encoding="utf-8").strip()
-            if base_content and base_content != skill_content:
-                sections.append(
-                    f"## Level {current_level} Cheat Sheet (from previous levels — DO NOT lose this info)\n{base_content}"
-                )
 
-        # Load previous level skills as reference (most recent first, max 2)
-        prev_levels_loaded = 0
-        for prev_level in range(current_level - 1, max(0, current_level - 3), -1):
-            prev_skill = skill_base / f"level{prev_level}" / "SKILL.md"
-            if prev_skill.is_file():
-                prev_content = prev_skill.read_text(encoding="utf-8").strip()
-                if prev_content:
-                    if len(prev_content) > 2000:
-                        prev_content = prev_content[:2000] + "\n... [truncated]"
-                    sections.append(
-                        f"## Evolved Skill — Level {prev_level} (reference)\n{prev_content}"
-                    )
-                    prev_levels_loaded += 1
-
-        # Also load legacy skill (arc-{game}/SKILL.md) as reference if it exists
-        legacy_skill = skill_base / "SKILL.md"
-        if legacy_skill.is_file():
-            legacy_content = legacy_skill.read_text(encoding="utf-8").strip()
-            if legacy_content:
-                if len(legacy_content) > 2000:
-                    legacy_content = legacy_content[:2000] + "\n... [truncated]"
-                # Use as current skill if no per-level skill exists, otherwise as reference
-                if not level_skill.is_file():
-                    sections.append(
-                        f"## Your Evolved Skill (from previous episodes)\n{legacy_content}"
-                    )
-                elif prev_levels_loaded == 0:
-                    sections.append(
-                        f"## Evolved Skill — Previous Levels (reference)\n{legacy_content}"
-                    )
+        # Legacy/previous level skills removed — FACTS.md provides game-wide knowledge
 
         return "\n\n".join(sections)
 
@@ -281,6 +244,13 @@ class LLM(Agent):
 
     def track_tokens(self, tokens: int, message: str = "") -> None:
         self.token_counter += tokens
+        if hasattr(self, "_game_stats") and self._game_stats:
+            self._game_stats.record_llm_call(
+                self.game_id,
+                getattr(self, "current_level", 1),
+                tokens,
+                step=len(getattr(self, "current_steps", [])),
+            )
         if hasattr(self, "recorder"):
             self.recorder.record({
                 "tokens": tokens,

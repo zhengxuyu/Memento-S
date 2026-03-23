@@ -1,27 +1,36 @@
-def find_path(sy, sx, ty, tx):
-    from collections import deque
-    q = deque()
-    q.append((sy, sx, []))
-    visited = set()
-    visited.add((sy, sx))
+def find_path(sy, sx, size, step, color_obstacles):
+    g = grids[1]
+    q = [[(sy, sx)]]
+    visited = set([(sy, sx)])
+    actions = {
+        (-step, 0): 'UP',
+        (step, 0): 'DOWN',
+        (0, -step): 'LEFT',
+        (0, step): 'RIGHT'
+    }
     
     while q:
-        y, x, path = q.popleft()
-        if y == ty and x == tx:
+        path = q.pop(0)
+        y, x = path[-1]
+        
+        # Check if button is reached
+        # Button bounds: 11..13, 50..52
+        if 8 <= y <= 15 and 48 <= x <= 53:
             return path
             
-        for dy, dx, act in [(-5, 0, 1), (5, 0, 2), (0, -5, 3), (0, 5, 4)]:
+        for dy, dx in [(-step, 0), (step, 0), (0, -step), (0, step)]:
             ny, nx = y + dy, x + dx
-            if 0 <= ny <= 59 and 0 <= nx <= 59:
-                # check if 5x5 area is free of obstacle 5 and 4
+            if 0 <= ny <= 64-size and 0 <= nx <= 64-size:
                 blocked = False
-                for r in range(ny, ny+5):
-                    for c in range(nx, nx+5):
-                        if grid[r][c] in [4, 5]:
+                for r in range(ny, ny+size):
+                    for c in range(nx, nx+size):
+                        if g[r][c] in color_obstacles:
                             blocked = True
                             break
                     if blocked: break
+                
                 if not blocked and (ny, nx) not in visited:
                     visited.add((ny, nx))
-                    q.append((ny, nx, path + [act]))
+                    q.append(path + [(ny, nx)])
+                    
     return None

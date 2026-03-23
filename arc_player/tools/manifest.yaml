@@ -1,0 +1,8 @@
+builtin_tools:
+  - list_memory
+  - read_memory
+  - write_memory
+  - promote_rule
+  - run_code
+  - bash
+custom_tools: []

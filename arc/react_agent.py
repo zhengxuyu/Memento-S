@@ -30,6 +30,7 @@ from arc.config import (
     MEMORY_DIR,
     MEMORY_WARMUP,
 )
+from arc.game_stats import GameStats
 from arc.llm_agent import LLM
 from arc.prompts import build_func_resp_prompt, build_user_prompt
 
@@ -68,7 +69,7 @@ _GAME_ACTIONS = frozenset({
 _TOOL_HANDLERS = {
     "update_skill": "_handle_update_skill",
     "load_skill": "_handle_load_skill",
-    # "run_code": "_handle_run_code",  # disabled to reduce token waste
+    "run_code": "_handle_run_code",
 }
 
 
@@ -306,6 +307,11 @@ class ReactAgent(LLM):
         self.current_level: int = 1  # Current level (1-indexed, = score + 1)
         self._arcade = arcade  # For scorecard submission
 
+        # Noise detection: auto-detect rows that change every action (timer bars, counters)
+        self._row_change_history: list[set[int]] = []
+        self._noise_rows: set[int] = set()
+        self._ineffective_actions: list[str] = []  # recent actions with no meaningful effect
+
         # Shortcut mode: replay solved levels without LLM
         self._shortcut_enabled = shortcut
         self._shortcut_file = Path(MEMORY_DIR) / f"{self.game_id}_shortcuts.json"
@@ -318,6 +324,13 @@ class ReactAgent(LLM):
             game_id=f"{self.game_id}_level{self.current_level}",
             warmup=memory_warmup,
         ) if memory else None
+
+        # Persistent game stats tracker
+        self._game_stats = GameStats(str(Path(MEMORY_DIR) / "game_stats.json"))
+
+        # Spatial model — learns player shape, step size, wall colors from observation
+        from arc.spatial_model import SpatialModel
+        self._spatial = SpatialModel()
 
 
     # ------------------------------------------------------------------
@@ -447,6 +460,7 @@ class ReactAgent(LLM):
             if result == "win":
                 if self.episode_memory:
                     self.episode_memory.record(self.current_steps, self._last_score, "win")
+                self._game_stats.record_episode_end(self.game_id, self.current_level, "win")
                 logger.info(
                     "WIN on attempt %d! Total actions: %d, time: %.1fs",
                     self.retry_count + 1, self.action_counter, self.seconds,
@@ -455,6 +469,10 @@ class ReactAgent(LLM):
             elif result in ("game_over", "max_actions"):
                 if self.episode_memory:
                     self.episode_memory.record(self.current_steps, self._last_score, result)
+                self._game_stats.record_episode_end(self.game_id, self.current_level, result)
+                # Postmortem: force LLM to reflect and write comprehensive skill before retry
+                self._force_postmortem_skill_update(result)
+                self._update_game_facts()
                 self.retry_count += 1
                 if self.retry_count >= MAX_RETRIES:
                     logger.info("Max retries (%d) exhausted, stopping", MAX_RETRIES)
@@ -468,6 +486,7 @@ class ReactAgent(LLM):
             elif result == "stopped":
                 if self.episode_memory:
                     self.episode_memory.record(self.current_steps, self._last_score, "stopped")
+                self._game_stats.record_episode_end(self.game_id, self.current_level, "stopped")
                 logger.info("Gracefully stopped at level %d, score=%d", self.current_level, self._last_score)
                 break
             else:
@@ -503,6 +522,7 @@ class ReactAgent(LLM):
                     completed_level = self.current_level
                     self._last_score = self._frame_score(self.frames[-1])
                     self._force_level_up_summary(completed_level)
+                    self._spatial.on_level_up()
                     self.current_level = self._last_score + 1
                     score_at_episode_start = self._last_score
                     self.current_steps = []
@@ -534,7 +554,7 @@ class ReactAgent(LLM):
         step_count = 0
         consecutive_tool_calls = 0
         consecutive_nones = 0
-        MAX_CONSECUTIVE_TOOLS = 3
+        MAX_CONSECUTIVE_TOOLS = 1
         MAX_CONSECUTIVE_NONES = 5
         skip_obs = False  # True after tool calls — go straight to LLM, no env call
         while True:
@@ -559,8 +579,10 @@ class ReactAgent(LLM):
                     # Record memory for completed level
                     if self.episode_memory:
                         self.episode_memory.record(self.current_steps, self._last_score, "level_up")
+                    self._game_stats.record_episode_end(self.game_id, completed_level, "level_up")
                     # Bootstrap new level skill from completed level's skill
                     self._force_level_up_summary(completed_level)
+                    self._spatial.on_level_up()
                     self.current_level = self._last_score + 1
                     logger.info(
                         "LEVEL UP to level %d! actions=%d, retries_used=%d",
@@ -577,6 +599,50 @@ class ReactAgent(LLM):
                     step_count = 0
                     score_at_episode_start = curr_score
                     # Continue playing — no RESET, no return
+
+                elif curr_score < self._last_score:
+                    # Score DROPPED — game reset us to an earlier level
+                    old_level = self.current_level
+                    self._last_score = curr_score
+                    self.current_level = curr_score + 1
+                    self.current_steps = []
+                    step_count = 0
+                    logger.warning(
+                        "SCORE DROP: %d -> %d, reset from level %d to level %d",
+                        self._last_score + (old_level - self.current_level),
+                        curr_score, old_level, self.current_level,
+                    )
+                    # Shortcut fast-forward through solved levels
+                    if self._shortcut_enabled:
+                        while str(self.current_level) in self._shortcuts:
+                            if self._replay_shortcut(self.current_level):
+                                completed_level = self.current_level
+                                self._last_score = self._frame_score(self.frames[-1])
+                                self.current_level = self._last_score + 1
+                                self.current_steps = []
+                                step_count = 0
+                                logger.info("RECOVERY SHORTCUT: fast-forwarded to level %d (score=%d)",
+                                            self.current_level, self._last_score)
+                                self._generate_live_video()
+                                if self.frames[-1].state is GameState.WIN:
+                                    return "win"
+                            else:
+                                logger.warning("RECOVERY SHORTCUT: failed for level %d, falling back to LLM",
+                                               self.current_level)
+                                break
+                    score_at_episode_start = self._last_score
+                    # Re-init conversation for the new level context
+                    self.messages = []
+                    self.push_message({"role": "user", "content": build_user_prompt()})
+                    self._latest_tool_call_id = "recovery_reset"
+                    self.push_message({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": self._latest_tool_call_id,
+                            "type": "function",
+                            "function": {"name": "RESET", "arguments": "{}"},
+                        }],
+                    })
 
                 # Check external stop signal
                 if self._check_stop():
@@ -595,16 +661,29 @@ class ReactAgent(LLM):
                 consecutive_nones = 0
                 tc_name, tc_args, tc_id, reasoning = action_result
                 self._latest_tool_call_id = tc_id
-                # Route action
-                if tc_name in _GAME_ACTIONS:
+                # Route action — reject blocked moves before execution
+                blocked_now = self._get_blocked_directions()
+                if tc_name in _GAME_ACTIONS and tc_name in blocked_now:
+                    logger.info("Rejected blocked action %s, sending wall feedback", tc_name)
+                    self.push_message({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": (
+                            f"REJECTED: {tc_name} is blocked by a wall. "
+                            f"Valid directions: {sorted(set(self._spatial.confirmed_displacements) - blocked_now)}. "
+                            "Pick a different direction."
+                        ),
+                    })
+                    skip_obs = True
+                elif tc_name in _GAME_ACTIONS:
                     self._execute_action(tc_name, tc_args, reasoning=reasoning)
                     step_count += 1
                     consecutive_tool_calls = 0
-                    # Force update_skill every 5 actions (independent LLM call)
-                    if step_count % 5 == 0:
+                    # Force update_skill every 15 actions (independent LLM call)
+                    if step_count % 15 == 0:
                         self._force_skill_update()
-                    skip_obs = False  # let main loop build observation normally
-                    if step_count % 5 == 0:
+                    skip_obs = False
+                    if step_count % 10 == 0:
                         self._generate_live_video()
                 elif tc_name in _TOOL_HANDLERS:
                     consecutive_tool_calls += 1
@@ -631,7 +710,7 @@ class ReactAgent(LLM):
                     self.push_message({
                         "role": "tool",
                         "tool_call_id": tc_id,
-                        "content": f"Error: '{tc_name}' is not a valid action. Use ACTION1-ACTION6, update_skill, or load_skill.",
+                        "content": f"Error: '{tc_name}' is not a valid action. Valid tools: ACTION1-ACTION6, update_skill, load_skill.",
                     })
                     skip_obs = True  # Don't call env, let LLM retry
             else:
@@ -667,7 +746,7 @@ class ReactAgent(LLM):
             max_actions=MAX_ACTIONS,
         )
 
-        function_catalog = ""  # run_code disabled
+        function_catalog = self._get_function_catalog()
 
         return build_func_resp_prompt(
             latest_frame=latest,
@@ -680,6 +759,8 @@ class ReactAgent(LLM):
             few_shot=few_shot,
             thinking_tools=thinking_tools,
             function_catalog=function_catalog,
+            noise_rows=self._noise_rows,
+            ineffective_actions=self._ineffective_actions,
         )
 
     def _build_action_history(self, n: int = 10) -> str:
@@ -736,16 +817,45 @@ class ReactAgent(LLM):
             return True
         return False
 
+    @staticmethod
+    def _is_transient_error(exc: Exception) -> bool:
+        """Check if an API error is transient and worth retrying."""
+        # Connection / network errors
+        if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError, TimeoutError, ConnectionError)):
+            return True
+        # Rate-limit (429)
+        if isinstance(exc, openai.RateLimitError):
+            return True
+        # Server errors (500, 502, 503, 504)
+        if hasattr(exc, "status_code") and exc.status_code in (500, 502, 503, 504):
+            return True
+        return False
+
     def _create_completion(self, client: Any, **kwargs: Any) -> Any:
-        """Wrapper: chat.completions.create with infinite retry on insufficient funds."""
+        """Wrapper: chat.completions.create with infinite retry on transient errors."""
+        backoff = 5
+        max_backoff = 120
         while True:
             try:
                 with _HardTimeout():
-                    return client.chat.completions.create(**kwargs)
+                    resp = client.chat.completions.create(**kwargs)
+                    backoff = 5  # reset on success
+                    return resp
             except Exception as e:
                 if self._is_funds_error(e):
                     logger.warning("Insufficient funds — waiting 60s before retry: %s", e)
                     time.sleep(60)
+                    continue
+                if self._is_transient_error(e):
+                    logger.warning("Transient API error — retrying in %ds: %s", backoff, e)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+                # Malformed response body (truncated JSON, etc.) — retry
+                if isinstance(e, json.JSONDecodeError):
+                    logger.warning("Malformed API response — retrying in %ds: %s", backoff, e)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
                     continue
                 raise
 
@@ -790,7 +900,8 @@ class ReactAgent(LLM):
 
         tools = self._build_tools()
 
-        # Phase 1: Get reasoning + possibly tool call
+        # Single call with tool_choice="required" — always get a tool call back.
+        # Reasoning still comes through in reasoning_content/thinking field.
         reasoning = ""
         for attempt in range(API_RETRIES):
             try:
@@ -798,7 +909,7 @@ class ReactAgent(LLM):
                     "model": self._model,
                     "messages": self._messages_for_api(),
                     "tools": tools,
-                    "tool_choice": "auto",
+                    "tool_choice": "required",
                 }
                 extra = self._extra_body
                 if extra:
@@ -835,63 +946,8 @@ class ReactAgent(LLM):
         if reasoning:
             logger.info("LLM reasoning: %s", reasoning[:300])
 
-        # If model returned tool calls, use them directly
         if message.tool_calls:
             return self._process_tool_calls(message, reasoning)
-
-        # No tool call — try to parse action from reasoning text (fast path)
-        if reasoning:
-            parsed_action = self._parse_action_from_text(reasoning)
-            if parsed_action:
-                tc_id = f"parsed_{self.action_counter}_{int(time.time())}"
-                logger.info("Parsed action from reasoning: %s", parsed_action)
-                # Inject as assistant message with synthetic tool call
-                self.push_message({
-                    "role": "assistant",
-                    "content": reasoning,
-                    "tool_calls": [{
-                        "id": tc_id,
-                        "type": "function",
-                        "function": {"name": parsed_action, "arguments": "{}"},
-                    }],
-                })
-                return (parsed_action, "{}", tc_id, reasoning)
-
-            # Phase 2 fallback: no action parseable, force tool call
-            self.push_message({"role": "assistant", "content": reasoning})
-            self.push_message({"role": "user", "content": "Now call exactly one action tool."})
-
-            for attempt in range(API_RETRIES):
-                try:
-                    create_kwargs = {
-                        "model": self._model,
-                        "messages": self._messages_for_api(),
-                        "tools": tools,
-                        "tool_choice": "required",
-                    }
-                    extra = self._extra_body
-                    if extra:
-                        create_kwargs["extra_body"] = extra
-                    response = self._create_completion(client, **create_kwargs)
-                    break
-                except (openai.BadRequestError, openai.APIConnectionError,
-                        openai.RateLimitError, openai.APITimeoutError,
-                        TimeoutError) as e:
-                    logger.warning("Phase 2 API error on attempt %d: %s", attempt + 1, e)
-                    if attempt == API_RETRIES - 1:
-                        return None
-                    time.sleep(2 ** attempt)
-            else:
-                return None
-
-            self.track_tokens(response.usage.total_tokens if response.usage else 0)
-            if not response.choices:
-                logger.warning("Empty choices from Phase 2 API")
-                return None
-            message = response.choices[0].message
-
-            if message.tool_calls:
-                return self._process_tool_calls(message, reasoning)
 
         return None
 
@@ -908,9 +964,16 @@ class ReactAgent(LLM):
             )
         return None
 
-    def _build_tools(self) -> list[dict[str, Any]]:
-        """Build tool list: ACTION1-6 + update_skill + load_skill + run_code."""
+    def _build_tools(self, filter_blocked: bool = True) -> list[dict[str, Any]]:
+        """Build tool list: ACTION1-6 + update_skill + load_skill.
+
+        If filter_blocked=True, removes movement actions that would hit a wall.
+        """
         tools = self.build_tools()
+        if filter_blocked:
+            blocked = self._get_blocked_directions()
+            if blocked:
+                tools = [t for t in tools if t["function"]["name"] not in blocked]
         tools.append({
             "type": "function",
             "function": {
@@ -953,8 +1016,230 @@ class ReactAgent(LLM):
                 },
             },
         })
-        # run_code disabled to reduce token waste
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "run_code",
+                "description": (
+                    "Execute Python code with game state variables. "
+                    "Use for computation: BFS pathfinding, pattern analysis, coordinate math. "
+                    "Available vars: grid (64x64 list), grids (all grids), score, step_count, action_history. "
+                    "Use print() to see results."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "Python code to execute",
+                        },
+                    },
+                    "required": ["code"],
+                },
+            },
+        })
         return tools
+
+    def _force_postmortem_skill_update(self, result: str) -> None:
+        """After game_over/max_actions, force LLM to write a comprehensive postmortem skill.
+
+        Uses the conversation history + current skill to produce a rich reflection
+        that preserves all learned knowledge and adds failure analysis.
+        """
+        # Load current skill
+        skill_base = Path(__file__).parent / "skills" / f"arc-{self.game_id}" / f"level{self.current_level}"
+        skill_content = ""
+        skill_path = skill_base / "SKILL.md"
+        if skill_path.is_file():
+            try:
+                skill_content = skill_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        base_content = ""
+        base_path = skill_base / "SKILL.base.md"
+        if base_path.is_file():
+            try:
+                base_content = base_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        if len(skill_content.strip()) < 20 and base_content:
+            skill_content = base_content
+
+        # Build action summary from current_steps
+        action_summary_lines = []
+        for i, step in enumerate(self.current_steps, 1):
+            action_summary_lines.append(
+                f"  {i}. {step.get('action', '?')} -> {step.get('effect', '?')} (score={step.get('score', 0)})"
+            )
+        action_summary = "\n".join(action_summary_lines[-50:])  # last 50 steps
+
+        # Include conversation history summary if available
+        history_summary = getattr(self, "_history_summary", "") or ""
+
+        messages = [
+            {"role": "system", "content": (
+                "You are performing a POST-MORTEM analysis after a failed episode of an ARC-AGI-3 grid game.\n\n"
+                "The episode ended with: " + result.upper() + "\n\n"
+                "Your job: write a COMPREHENSIVE updated SKILL.md that preserves ALL existing knowledge "
+                "and adds critical failure analysis. The next attempt will ONLY have access to this skill file.\n\n"
+                "The skill file MUST include these sections:\n"
+                "1. **World Model** — bullet points describing your understanding of the game world:\n"
+                "   - Grid layout, dimensions, key regions\n"
+                "   - Object types, colors, and their roles\n"
+                "   - Movement mechanics (how the player moves, constraints)\n"
+                "   - Interaction rules (what happens when objects meet)\n"
+                "   - Scoring conditions (what triggers score increase)\n"
+                "2. **Confirmed Facts** — things you KNOW are true (tested and verified)\n"
+                "3. **Working Hypotheses** — things you SUSPECT but haven't fully confirmed\n"
+                "4. **Failure Analysis** — why this episode failed, what went wrong\n"
+                "5. **Strategy for Next Attempt** — concrete, specific steps to try next time\n"
+                "6. **Action Mappings** — what each ACTION does (if discovered)\n\n"
+                "Rules:\n"
+                "- NEVER lose information. If the old skill file had useful content, KEEP IT.\n"
+                "- Be SPECIFIC: use coordinates, color numbers, step counts.\n"
+                "- The next agent starts from SCRATCH — this file is its ONLY memory."
+            )},
+            {"role": "user", "content": (
+                f"# Current Skill File:\n```\n{skill_content}\n```\n\n"
+                + (f"# History Summary:\n{history_summary}\n\n" if history_summary else "")
+                + f"# Episode Actions ({len(self.current_steps)} steps, result: {result}):\n{action_summary}\n\n"
+                f"# Episode Stats:\n"
+                f"- Total actions this episode: {len(self.current_steps)}\n"
+                f"- Retry count: {self.retry_count}\n"
+                f"- Final score: {self._last_score}\n"
+                f"- Current level: {self.current_level}\n\n"
+                "Write the FULL updated SKILL.md now. It must be LONGER and MORE DETAILED than the current one."
+            )},
+        ]
+
+        from arc.config import OPENROUTER_BASE_URL, API_TIMEOUT
+        api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+        client = OpenAIClient(
+            api_key=api_key,
+            base_url=OPENROUTER_BASE_URL,
+            timeout=API_TIMEOUT,
+        )
+
+        update_tool = [t for t in self._build_tools() if t["function"]["name"] == "update_skill"]
+
+        for attempt in range(API_RETRIES):
+            try:
+                create_kwargs: dict[str, Any] = {
+                    "model": self._model,
+                    "messages": messages,
+                    "tools": update_tool,
+                    "tool_choice": {"type": "function", "function": {"name": "update_skill"}},
+                }
+                extra = self._extra_body
+                if extra:
+                    create_kwargs["extra_body"] = extra
+                response = self._create_completion(client, **create_kwargs)
+                break
+            except (openai.BadRequestError, openai.APIConnectionError,
+                    openai.RateLimitError, openai.APITimeoutError,
+                    TimeoutError) as e:
+                logger.warning("Postmortem skill update API error on attempt %d: %s", attempt + 1, e)
+                if attempt == API_RETRIES - 1:
+                    return
+                time.sleep(2 ** attempt)
+        else:
+            return
+
+        self.track_tokens(response.usage.total_tokens if response.usage else 0)
+        if not response.choices:
+            return
+
+        message = response.choices[0].message
+        if message.tool_calls:
+            tc = message.tool_calls[0]
+            result_msg = self._handle_update_skill(tc.function.arguments or "{}")
+            logger.info("Postmortem skill update completed: %s", result_msg)
+        else:
+            logger.warning("Postmortem skill update: LLM did not return tool call")
+
+    def _update_game_facts(self) -> None:
+        """Extract universal game mechanics from current SKILL.md into game-wide FACTS.md."""
+        skill_base = Path(__file__).parent / "skills" / f"arc-{self.game_id}"
+
+        # Load current level's SKILL.md (freshly updated by postmortem)
+        skill_path = skill_base / f"level{self.current_level}" / "SKILL.md"
+        if not skill_path.is_file():
+            return
+        skill_content = skill_path.read_text(encoding="utf-8").strip()
+        if len(skill_content) < 50:
+            return
+
+        # Load existing FACTS.md if any
+        facts_path = skill_base / "FACTS.md"
+        existing_facts = ""
+        if facts_path.is_file():
+            existing_facts = facts_path.read_text(encoding="utf-8").strip()
+
+        # Short LLM call to merge new facts with existing
+        messages = [
+            {"role": "system", "content": (
+                "You are extracting UNIVERSAL GAME MECHANICS from a level-specific skill file.\n\n"
+                "Output a concise FACTS.md that contains ONLY things that are true for ALL levels:\n"
+                "- Movement mechanics (player shape, step size, controls)\n"
+                "- Object types and their effects (buttons, gates, collectibles, timers)\n"
+                "- Interaction rules (how to activate objects, what triggers scoring)\n"
+                "- Resource management (timer mechanics, how to extend time)\n"
+                "- Action mappings (what each ACTION does)\n\n"
+                "Rules:\n"
+                "- NO coordinates or level-specific layouts\n"
+                "- NO strategy or pathing advice\n"
+                "- MERGE with existing facts — never lose confirmed facts\n"
+                "- Be SPECIFIC: use color numbers, exact sizes, precise mechanics\n"
+                "- Keep under 600 words — this is a quick-reference card"
+            )},
+            {"role": "user", "content": (
+                (f"# Existing Game Facts:\n```\n{existing_facts}\n```\n\n" if existing_facts else "")
+                + f"# Level {self.current_level} Skill File (latest):\n```\n{skill_content}\n```\n\n"
+                "Extract and merge universal game mechanics into FACTS.md."
+            )},
+        ]
+
+        from arc.config import OPENROUTER_BASE_URL, API_TIMEOUT
+        api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+        client = OpenAIClient(
+            api_key=api_key,
+            base_url=OPENROUTER_BASE_URL,
+            timeout=API_TIMEOUT,
+        )
+
+        for attempt in range(API_RETRIES):
+            try:
+                create_kwargs: dict[str, Any] = {
+                    "model": self._model,
+                    "messages": messages,
+                    "max_tokens": 1500,
+                }
+                extra = self._extra_body
+                if extra:
+                    create_kwargs["extra_body"] = extra
+                response = self._create_completion(client, **create_kwargs)
+                break
+            except (openai.BadRequestError, openai.APIConnectionError,
+                    openai.RateLimitError, openai.APITimeoutError,
+                    TimeoutError) as e:
+                logger.warning("Game facts update API error on attempt %d: %s", attempt + 1, e)
+                if attempt == API_RETRIES - 1:
+                    return
+                time.sleep(2 ** attempt)
+        else:
+            return
+
+        self.track_tokens(response.usage.total_tokens if response.usage else 0)
+        if not response.choices:
+            return
+
+        content = response.choices[0].message.content or ""
+        if content and len(content.strip()) > 20:
+            skill_base.mkdir(parents=True, exist_ok=True)
+            facts_path.write_text(content.strip(), encoding="utf-8")
+            logger.info("Game facts updated: %s (%d chars)", facts_path, len(content.strip()))
+        else:
+            logger.warning("Game facts update: content too short (%d chars)", len(content))
 
     def _force_skill_update(self) -> None:
         """Force LLM to call update_skill after a game action.
@@ -990,7 +1275,13 @@ class ReactAgent(LLM):
             {"role": "system", "content": (
                 "You are updating a skill file for an ARC-AGI-3 grid game. "
                 "Based on the observation below, call update_skill with the FULL updated SKILL.md content. "
-                "Preserve all existing knowledge and add new discoveries."
+                "Preserve all existing knowledge and add new discoveries.\n\n"
+                "IMPORTANT: Your skill file MUST include a '## World Model' section with bullet points describing:\n"
+                "- Grid layout and key regions you've identified\n"
+                "- Object types (colors, shapes) and their roles\n"
+                "- Movement/interaction rules you've confirmed\n"
+                "- Scoring conditions and level completion triggers\n"
+                "Keep this section up-to-date as your understanding evolves."
             )},
             {"role": "user", "content": (
                 f"# Current Skill File:\n```\n{skill_content}\n```\n\n"
@@ -1066,6 +1357,22 @@ class ReactAgent(LLM):
         if not prev_content:
             return
 
+        # Load game-wide facts
+        facts_path = skill_base / "FACTS.md"
+        facts_content = ""
+        if facts_path.is_file():
+            facts_content = facts_path.read_text(encoding="utf-8").strip()
+
+        # Also load latest game_over archive from target level (if exists from previous run)
+        target_dir = skill_base / f"level{new_level}"
+        prev_attempt_content = ""
+        if target_dir.is_dir():
+            archives = sorted(target_dir.glob("SKILL.game_over.*.md"), reverse=True)
+            if archives:
+                prev_attempt_content = archives[0].read_text(encoding="utf-8").strip()
+                if len(prev_attempt_content) > 2000:
+                    prev_attempt_content = prev_attempt_content[:2000] + "\n... [truncated]"
+
         # Build standalone LLM call
         messages = [
             {"role": "system", "content": (
@@ -1084,6 +1391,10 @@ class ReactAgent(LLM):
                 "# Controls\n"
                 "- Action 1: <what it does>\n"
                 "...\n\n"
+                "# Game-Wide Mechanics\n"
+                "- <universal mechanic 1>\n"
+                "- <universal mechanic 2>\n"
+                "...\n\n"
                 "# Key Facts\n"
                 "- <critical fact 1>\n"
                 "- <critical fact 2>\n"
@@ -1092,13 +1403,17 @@ class ReactAgent(LLM):
                 "Rules:\n"
                 "- 'How To Win' is the MOST IMPORTANT section. Be specific: what to find, "
                 "what to interact with, what triggers level completion.\n"
+                "- ALWAYS include ALL object types, their colors, and their effects (buttons, gates, collectibles, timers)\n"
+                "- ALWAYS include resource/timer mechanics — how time works, what extends it\n"
                 "- NO coordinates from the old level (layout will be different).\n"
                 "- NO filler or generic advice. Every line must be a concrete, tested fact.\n"
-                "- Keep it SHORT — under 800 words."
+                "- Keep it under 1200 words."
             )},
             {"role": "user", "content": (
                 f"# Level {completed_level} Skill (just completed):\n```\n{prev_content}\n```\n\n"
-                f"Distill this into a cheat sheet for Level {new_level}. "
+                + (f"# Universal Game Facts (from all levels):\n```\n{facts_content}\n```\n\n" if facts_content else "")
+                + (f"# Previous Attempt on Level {new_level} (from earlier run):\n```\n{prev_attempt_content}\n```\n\n" if prev_attempt_content else "")
+                + f"Distill this into a cheat sheet for Level {new_level}. "
                 "Focus on the WINNING PROCEDURE — what exactly must the player do to score?"
             )},
         ]
@@ -1196,7 +1511,8 @@ class ReactAgent(LLM):
                 from datetime import datetime
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 step = len(self.current_steps)
-                backup_name = f"SKILL.step{step}.{ts}.md"
+                ep = self.retry_count
+                backup_name = f"SKILL.ep{ep}.step{step}.{ts}.md"
                 (skill_dir / backup_name).write_text(old, encoding="utf-8")
                 logger.info("Skill backup: %s", backup_name)
 
@@ -1350,6 +1666,58 @@ class ReactAgent(LLM):
         return output
 
     # ------------------------------------------------------------------
+    # Spatial awareness — delegated to SpatialModel
+    # ------------------------------------------------------------------
+
+    def _find_player_position(self, grid: list[list[int]]) -> Optional[tuple[int, int]]:
+        """Find player position via auto-learned SpatialModel."""
+        return self._spatial.find_player(grid)
+
+    def _get_blocked_directions(self) -> set[str]:
+        """Return set of ACTION names that would hit a wall (auto-learned)."""
+        if not self.frames:
+            return set()
+        latest = self.frames[-1]
+        if not latest.frame:
+            return set()
+        grid = latest.frame[0]
+        return self._spatial.get_blocked_directions(grid)
+
+    # ------------------------------------------------------------------
+    # Noise detection (auto-detect timer bars, counters, etc.)
+    # ------------------------------------------------------------------
+
+    def _update_noise_detection(self, prev_grid: list[list[int]], curr_grid: list[list[int]]) -> None:
+        """Track which rows changed and auto-detect noise rows.
+
+        After 3+ actions, any row that changed in EVERY action is classified
+        as "noise" (timer bar, counter, animation) and excluded from
+        meaningful-change detection.
+        """
+        changed_rows: set[int] = set()
+        for r, (prev_row, curr_row) in enumerate(zip(prev_grid, curr_grid)):
+            if prev_row != curr_row:
+                changed_rows.add(r)
+        self._row_change_history.append(changed_rows)
+        # Keep last 5 for intersection
+        if len(self._row_change_history) > 5:
+            self._row_change_history = self._row_change_history[-5:]
+        # After 3+ actions, rows that changed EVERY time are noise
+        if len(self._row_change_history) >= 3:
+            self._noise_rows = set.intersection(*self._row_change_history)
+            if self._noise_rows:
+                logger.debug("Noise rows detected: %s", sorted(self._noise_rows))
+
+    def _meaningful_grid_changed(self, prev_grid: list[list[int]], curr_grid: list[list[int]]) -> bool:
+        """Check if grid changed in non-noise rows."""
+        for r, (prev_row, curr_row) in enumerate(zip(prev_grid, curr_grid)):
+            if r in self._noise_rows:
+                continue
+            if prev_row != curr_row:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
     # Action execution
     # ------------------------------------------------------------------
 
@@ -1378,6 +1746,7 @@ class ReactAgent(LLM):
             self.append_frame(frame)
         self.action_counter += 1
         self.last_action_name = name
+        self._game_stats.record_step(self.game_id, self.current_level)
 
         # Post-action state
         latest = self.frames[-1]
@@ -1385,9 +1754,25 @@ class ReactAgent(LLM):
         curr_grid = latest.frame[0] if latest.frame else None
         self._last_score = curr_score
 
-        # Determine effect
+        # Determine effect — filter out noise rows (timer bars, etc.)
         if prev_grid and curr_grid:
-            effect = "grid_changed" if prev_grid != curr_grid else "no_change"
+            if name != "RESET":
+                self._update_noise_detection(prev_grid, curr_grid)
+            if self._meaningful_grid_changed(prev_grid, curr_grid):
+                effect = "meaningful_change"
+            else:
+                effect = "no_effect"
+                if name != "RESET":
+                    self._ineffective_actions.append(name)
+                    # Cap at last 20
+                    if len(self._ineffective_actions) > 20:
+                        self._ineffective_actions = self._ineffective_actions[-20:]
+            # Feed SpatialModel (learn player shape, walls from observation)
+            if name != "RESET" and name.startswith("ACTION") and prev_grid and curr_grid:
+                if effect == "no_effect":
+                    self._spatial.learn_from_block(name, curr_grid)
+                elif effect == "meaningful_change":
+                    self._spatial.learn_from_move(name, prev_grid, curr_grid, self._noise_rows)
         else:
             effect = "unknown"
 
@@ -1430,8 +1815,11 @@ class ReactAgent(LLM):
         """Reset state for a new attempt, keeping learned knowledge in SKILL.md.
 
         Note: action_counter is NOT reset — arc env steps are cumulative.
+        Noise detection is also kept — timer bars don't change between retries.
         """
         self.current_steps = []
+        self._ineffective_actions = []
+        # Keep _noise_rows and _row_change_history — they carry over between retries
         # Messages reset happens in _play_episode
 
     def _generate_live_video(self) -> None:

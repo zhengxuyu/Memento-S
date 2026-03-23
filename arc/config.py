@@ -19,7 +19,7 @@ OPENROUTER_BASE_URL = (
     (os.getenv("OPENROUTER_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "").strip()
     or "https://openrouter.ai/api/v1"
 )
-ARC_AGI_MODEL = os.getenv("ARC_AGI_MODEL", "").strip() or "qwen/qwen3.5-397b-a17b"
+ARC_AGI_MODEL = os.getenv("ARC_AGI_MODEL", "").strip() or "openai/gpt-5.4-mini"
 
 # ARC environment
 ARC_API_KEY = os.getenv("ARC_API_KEY", "")

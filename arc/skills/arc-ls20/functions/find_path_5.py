@@ -1,25 +1,17 @@
-def find_path_5(grid, sy, sx, ty, tx, exact=False):
-    from collections import deque
-    queue = deque([(sy, sx, [])])
-    visited = set([(sy, sx)])
-    
+def find_path_5(sy, sx, ty, tx, gr):
+    visited = set()
+    queue = [(sy, sx, [])]
     while queue:
-        y, x, path = queue.popleft()
-        
-        if exact:
-            if y == ty and x == tx:
-                return path
-        else:
-            # Overlap with button at ty, tx
-            # any point of the 5x5 player overlaps any part of the button?
-            # button bounds: let's say (31,21)-(33,22) approx
-            # button center is ~32,21. Overlap means:
-            if abs((y+2) - 32) <= 3 and abs((x+2) - 21) <= 3:
-                return path
-                
-        for move_name, dy, dx in [('U', -5, 0), ('D', 5, 0), ('L', 0, -5), ('R', 0, 5)]:
-            ny, nx = y + dy, x + dx
-            if (ny, nx) not in visited and can_fit_5(grid, ny, nx):
-                visited.add((ny, nx))
-                queue.append((ny, nx, path + [move_name]))
+        cy, cx, p = queue.pop(0)
+        if (cy, cx) == (ty, tx): return p
+        if (cy, cx) in visited: continue
+        visited.add((cy, cx))
+        for dy, dx, a in [(-5,0,1), (5,0,2), (0,-5,3), (0,5,4)]:
+            ny, nx = cy+dy, cx+dx
+            valid = True
+            for r in range(ny, ny+5):
+                for c in range(nx, nx+5):
+                    if r<0 or r>=64 or c<0 or c>=64 or gr[r][c] in [4,5]:
+                        valid = False            
+            if valid: queue.append((ny, nx, p+[a]))
     return None

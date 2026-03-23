@@ -131,10 +131,11 @@ def detect_situations(
         if len(set(last_actions)) == 1 and last_actions[0]:
             situations.append("repeating")
 
-        # Stuck (no change): last 3+ actions produced no grid change
+        # Stuck (no change): last 3+ actions produced no meaningful grid change
         no_change_streak = 0
         for step in reversed(recent):
-            if "no_change" in step.get("effect", ""):
+            eff = step.get("effect", "")
+            if "no_change" in eff or "no_effect" in eff:
                 no_change_streak += 1
             else:
                 break
